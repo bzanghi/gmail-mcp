@@ -1,0 +1,10 @@
+{
+  "client_secrets_file": "client_secret.json",
+  "accounts": [
+    { "name": "personal",     "email": "me@gmail.com",        "description": "Personal mail" },
+    { "name": "work-main",    "email": "me@company.com",      "description": "Primary business account" },
+    { "name": "work-sales",   "email": "sales@company.com",   "description": "Inbound leads and quotes" },
+    { "name": "work-billing", "email": "billing@company.com", "description": "Invoices and payments" },
+    { "name": "work-support", "email": "support@company.com", "description": "Customer support" }
+  ]
+}

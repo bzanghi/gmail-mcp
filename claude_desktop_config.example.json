@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "/absolute/path/to/python",
+      "args": ["-m", "gmail_mcp"]
+    }
+  }
+}
