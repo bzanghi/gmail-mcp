@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -26,6 +27,18 @@ API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_CONCURRENT_FETCHES = 16
 
 DEFAULT_TIMEOUT = 30.0
+
+
+def _path_segment(value: str) -> str:
+    """Percent-encode a value for safe use as a single URL path segment.
+
+    Message, thread, and label IDs reach this client from model-supplied tool
+    arguments. Interpolating them into a URL path unescaped would let a value
+    like ``../../settings/forwarding`` retarget the request to a different
+    Gmail endpoint than the tool intends -- same host and same bearer token,
+    different operation. Encoding ``/`` and ``.`` away removes that entirely.
+    """
+    return quote(str(value), safe="")
 
 
 class GmailApiError(RuntimeError):
@@ -161,7 +174,7 @@ class GmailClient:
             # responses small on threads with long header chains.
             params["metadataHeaders"] = ["From", "To", "Cc", "Subject", "Date"]
         return await self._request(
-            account, "GET", f"/messages/{message_id}", params=params
+            account, "GET", f"/messages/{_path_segment(message_id)}", params=params
         )
 
     async def get_messages(
@@ -187,7 +200,10 @@ class GmailClient:
     ) -> dict[str, Any]:
         """Fetch a full thread with all of its messages."""
         return await self._request(
-            account, "GET", f"/threads/{thread_id}", params={"format": fmt}
+            account,
+            "GET",
+            f"/threads/{_path_segment(thread_id)}",
+            params={"format": fmt},
         )
 
     async def send_message(
@@ -226,7 +242,10 @@ class GmailClient:
         if remove_label_ids:
             body["removeLabelIds"] = remove_label_ids
         return await self._request(
-            account, "POST", f"/messages/{message_id}/modify", json_body=body
+            account,
+            "POST",
+            f"/messages/{_path_segment(message_id)}/modify",
+            json_body=body,
         )
 
     async def list_labels(self, account: str) -> list[dict[str, Any]]:

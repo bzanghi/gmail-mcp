@@ -79,6 +79,47 @@ class TestFetching:
         assert len(thread["messages"]) == 2
 
 
+class TestPathInjection:
+    """IDs arrive as model-supplied tool arguments and must not steer the URL.
+
+    Assertions use ``raw_path`` -- the bytes actually sent -- because httpx's
+    ``.path`` property percent-decodes for display and would show traversal
+    that never leaves the process.
+    """
+
+    async def test_traversal_in_message_id_cannot_retarget_endpoint(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        with pytest.raises(GmailApiError):
+            await gmail_client.get_message("personal", "../../settings/forwarding")
+        raw = fake_gmail.requests[-1].url.raw_path.decode()
+        assert "/messages/..%2F..%2Fsettings%2Fforwarding" in raw
+        assert "/settings/forwarding" not in raw
+
+    async def test_traversal_in_thread_id_is_encoded(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        await gmail_client.get_thread("personal", "../messages")
+        raw = fake_gmail.requests[-1].url.raw_path.decode()
+        assert "/threads/..%2Fmessages" in raw
+
+    async def test_traversal_in_modify_id_is_encoded(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        await gmail_client.modify_message(
+            "personal", "../../drafts", add_label_ids=["STARRED"]
+        )
+        raw = fake_gmail.requests[-1].url.raw_path.decode()
+        assert "/messages/..%2F..%2Fdrafts/modify" in raw
+
+    async def test_ordinary_ids_are_unchanged(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        await gmail_client.get_message("personal", "msg-plain")
+        raw = fake_gmail.requests[-1].url.raw_path.decode()
+        assert "/messages/msg-plain" in raw
+
+
 class TestBearerTokens:
     async def test_authorization_header_present(
         self, gmail_client: GmailClient, fake_gmail: FakeGmail
