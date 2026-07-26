@@ -288,6 +288,110 @@ class TestLabels:
         assert fake_gmail.modifications == []
 
 
+class TestBulkLabels:
+    async def test_many_ids_use_one_batch_call(self, fake_gmail: FakeGmail) -> None:
+        out = await call(
+            "gmail_modify_labels",
+            account="personal",
+            message_ids=["a", "b", "c", "d"],
+            remove_labels=["UNREAD"],
+        )
+        data = json.loads(out)
+        assert data["modified_count"] == 4
+        batch = [r for r in fake_gmail.requests if r.url.path.endswith("batchModify")]
+        assert len(batch) == 1
+
+    async def test_single_id_still_returns_labels(self) -> None:
+        out = await call(
+            "gmail_modify_labels",
+            account="personal",
+            message_id="msg-plain",
+            add_labels=["STARRED"],
+        )
+        assert "STARRED" in json.loads(out)["labels"]
+
+    async def test_no_ids_is_rejected(self, fake_gmail: FakeGmail) -> None:
+        out = await call(
+            "gmail_modify_labels", account="personal", add_labels=["STARRED"]
+        )
+        assert out.startswith("Error:")
+        assert fake_gmail.modifications == []
+
+
+class TestDraftTools:
+    async def test_list_drafts(self) -> None:
+        data = json.loads(await call("gmail_list_drafts", account="personal"))
+        assert data["drafts"][0]["draft_id"] == "draft-1"
+
+    async def test_send_draft(self, fake_gmail: FakeGmail) -> None:
+        data = json.loads(
+            await call("gmail_send_draft", account="personal", draft_id="draft-1")
+        )
+        assert data["status"] == "sent"
+        assert fake_gmail.sent_drafts == ["draft-1"]
+
+
+class TestAttachments:
+    async def test_flagged_in_search_results(self) -> None:
+        data = json.loads(
+            await call(
+                "gmail_search_messages", account="personal", response_format="json"
+            )
+        )
+        by_id = {m["id"]: m for m in data["messages"]}
+        assert by_id["msg-multipart"]["has_attachments"] is True
+        assert by_id["msg-plain"]["has_attachments"] is False
+
+    async def test_metadata_exposed_on_read(self) -> None:
+        data = json.loads(
+            await call(
+                "gmail_read_message",
+                account="personal",
+                message_id="msg-multipart",
+                response_format="json",
+            )
+        )
+        attachment = data["messages"][0]["attachments"][0]
+        assert attachment["filename"] == "invoice.pdf"
+        assert attachment["mime_type"] == "application/pdf"
+        assert attachment["size_bytes"] == 51200
+
+    async def test_shown_in_markdown(self) -> None:
+        out = await call(
+            "gmail_read_message", account="personal", message_id="msg-multipart"
+        )
+        assert "invoice.pdf" in out
+
+
+class TestReplyAll:
+    async def test_copies_everyone_except_self(self, fake_gmail: FakeGmail) -> None:
+        import base64
+
+        await call(
+            "gmail_send_message",
+            account="personal",
+            body="Thanks all",
+            reply_to_message_id="msg-multipart",
+            reply_all=True,
+        )
+        raw = base64.urlsafe_b64decode(fake_gmail.sent[-1]["raw"] + "==").decode()
+        assert "cfo@example.com" in raw, "original Cc should be carried over"
+        # The fake profile reports user@example.com as this account's address.
+        assert "user@example.com" not in raw, "must not copy the sender"
+
+    async def test_off_by_default(self, fake_gmail: FakeGmail) -> None:
+        import base64
+
+        await call(
+            "gmail_send_message",
+            account="personal",
+            body="Thanks",
+            reply_to_message_id="msg-multipart",
+        )
+        raw = base64.urlsafe_b64decode(fake_gmail.sent[-1]["raw"] + "==").decode()
+        assert "cfo@example.com" not in raw
+
+
 class TestCheckInboxes:
     async def test_covers_all_accounts_by_default(self) -> None:
         data = json.loads(await call("gmail_check_inboxes", response_format="json"))
@@ -344,7 +448,7 @@ class TestCheckInboxes:
 
 
 class TestToolRegistration:
-    async def test_all_nine_tools_registered(self) -> None:
+    async def test_expected_tools_registered(self) -> None:
         names = {t.name for t in await server.mcp.list_tools()}
         assert names == {
             "gmail_list_accounts",
@@ -353,6 +457,8 @@ class TestToolRegistration:
             "gmail_read_thread",
             "gmail_send_message",
             "gmail_create_draft",
+            "gmail_list_drafts",
+            "gmail_send_draft",
             "gmail_modify_labels",
             "gmail_list_labels",
             "gmail_check_inboxes",

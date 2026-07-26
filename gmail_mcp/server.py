@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import sys
 from enum import Enum
 from typing import Any, Optional
 
@@ -26,7 +29,17 @@ from .formatting import (
     summarize_message,
 )
 from .gmail_client import GmailApiError, GmailClient
-from .mime import build_message, reply_metadata
+from .mime import build_message, dedupe_addresses, reply_metadata, split_addresses
+
+# Logs go to stderr, never stdout: stdout carries the MCP protocol itself, and
+# a stray print there corrupts the stream. Level is settable via GMAIL_MCP_LOG
+# so a user debugging a scheduled run can get detail without a code change.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=os.environ.get("GMAIL_MCP_LOG", "WARNING").upper(),
+    format="%(asctime)s %(levelname)s gmail_mcp %(message)s",
+)
+logger = logging.getLogger("gmail_mcp")
 
 mcp = FastMCP("gmail_mcp")
 
@@ -79,9 +92,16 @@ _state = _AppState()
 
 
 def _handle_error(exc: Exception) -> str:
-    """Convert an exception into an actionable message for the model."""
+    """Convert an exception into an actionable message for the model.
+
+    Expected failures (bad config, revoked token, Gmail 404) are returned as
+    text the model can act on. Anything unexpected is logged with a traceback
+    to stderr so it is diagnosable, while the model still gets a clean string.
+    """
     if isinstance(exc, (ConfigError, AuthError, GmailApiError, ValueError)):
+        logger.debug("Tool returned an expected error: %s", exc)
         return f"Error: {exc}"
+    logger.exception("Unexpected error in tool call")
     return f"Error: Unexpected {type(exc).__name__}: {exc}"
 
 
@@ -207,6 +227,13 @@ class SendInput(_Base):
         "threading headers, and thread are derived from it automatically, so "
         "'to' and 'subject' may be left to their defaults.",
     )
+    reply_all: bool = Field(
+        default=False,
+        description="With 'reply_to_message_id', also copy everyone on the "
+        "original's To and Cc lines, excluding this account's own address. "
+        "Ignored when not replying. Confirm with the user before using it — "
+        "it widens the audience of the message.",
+    )
 
     @field_validator("to", "cc", "bcc")
     @classmethod
@@ -228,7 +255,18 @@ class ModifyLabelsInput(_Base):
     """Input for changing labels on a message."""
 
     account: str = Field(..., description="Account alias holding the message.", min_length=1)
-    message_id: str = Field(..., description="Gmail message ID.", min_length=1)
+    message_id: Optional[str] = Field(
+        default=None,
+        description="A single Gmail message ID. Use 'message_ids' instead to "
+        "change many messages at once.",
+    )
+    message_ids: list[str] = Field(
+        default_factory=list,
+        description="Several Gmail message IDs to change together. Far cheaper "
+        "than repeated single calls — prefer this for bulk operations such as "
+        "marking a search's worth of mail as read.",
+        max_length=1000,
+    )
     add_labels: list[str] = Field(
         default_factory=list,
         description="Label IDs to add. System labels include 'STARRED', "
@@ -247,6 +285,22 @@ class ListLabelsInput(_Base):
     """Input for listing labels."""
 
     account: str = Field(..., description="Account alias to list labels for.", min_length=1)
+
+
+class ListDraftsInput(_Base):
+    """Input for listing drafts."""
+
+    account: str = Field(..., description="Account alias to list drafts for.", min_length=1)
+    limit: int = Field(default=20, description="Maximum drafts to return.", ge=1, le=100)
+
+
+class SendDraftInput(_Base):
+    """Input for sending an existing draft."""
+
+    account: str = Field(..., description="Account alias holding the draft.", min_length=1)
+    draft_id: str = Field(
+        ..., description="Draft ID from gmail_list_drafts.", min_length=1
+    )
 
 
 class CheckInboxesInput(_Base):
@@ -521,6 +575,7 @@ async def _compose(
     reply_headers: dict[str, str] = {}
     thread_id: str | None = None
     to = list(params.to)
+    cc = list(params.cc)
     subject = params.subject
 
     if params.reply_to_message_id:
@@ -536,7 +591,17 @@ async def _compose(
         if not subject:
             subject = meta["subject"]
         if not to and meta["reply_to"]:
-            to = [meta["reply_to"]]
+            to = split_addresses(meta["reply_to"]) or [meta["reply_to"]]
+
+        if params.reply_all:
+            # Everyone on the original minus this account, so the sender does
+            # not receive their own reply and nobody is copied twice.
+            own = await client.get_profile(account_name)
+            own_address = str(own.get("emailAddress", ""))
+            others = split_addresses(meta["original_to"]) + split_addresses(
+                meta["original_cc"]
+            )
+            cc = dedupe_addresses(cc + others, exclude=[own_address, *to])
 
     if not to:
         raise ValueError(
@@ -548,7 +613,7 @@ async def _compose(
         to=to,
         subject=subject,
         body=params.body,
-        cc=params.cc,
+        cc=cc,
         bcc=params.bcc,
         reply_headers=reply_headers,
     )
@@ -707,20 +772,47 @@ async def gmail_modify_labels(params: ModifyLabelsInput) -> str:
                 "Error: Specify at least one label in 'add_labels' or "
                 "'remove_labels'."
             )
+        ids = list(params.message_ids)
+        if params.message_id:
+            ids.insert(0, params.message_id)
+        if not ids:
+            return "Error: Provide 'message_id' or a non-empty 'message_ids'."
+
         config, client = await _state.get()
         account = config.get(params.account)
-        result = await client.modify_message(
+
+        if len(ids) == 1:
+            result = await client.modify_message(
+                account.name,
+                ids[0],
+                add_label_ids=params.add_labels,
+                remove_label_ids=params.remove_labels,
+            )
+            return json.dumps(
+                {
+                    "status": "modified",
+                    "account": account.name,
+                    "message_id": result.get("id", ids[0]),
+                    "labels": result.get("labelIds", []),
+                },
+                indent=2,
+            )
+
+        # batchModify returns no body, so report what was submitted.
+        count = await client.batch_modify_messages(
             account.name,
-            params.message_id,
+            ids,
             add_label_ids=params.add_labels,
             remove_label_ids=params.remove_labels,
         )
+        logger.info("Batch-modified %d messages in %s", count, account.name)
         return json.dumps(
             {
                 "status": "modified",
                 "account": account.name,
-                "message_id": result.get("id", params.message_id),
-                "labels": result.get("labelIds", []),
+                "modified_count": count,
+                "added": params.add_labels,
+                "removed": params.remove_labels,
             },
             indent=2,
         )
@@ -775,6 +867,113 @@ async def gmail_list_labels(params: ListLabelsInput) -> str:
                     }
                     for label in labels
                 ],
+            },
+            indent=2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _handle_error(exc)
+
+
+@mcp.tool(
+    name="gmail_list_drafts",
+    annotations={
+        "title": "List Gmail Drafts",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def gmail_list_drafts(params: ListDraftsInput) -> str:
+    """List the drafts waiting in an account.
+
+    Use this to find a draft you created earlier — for example to check
+    whether one is still unsent, or to get a draft_id for gmail_send_draft.
+
+    Args:
+        params (ListDraftsInput): Containing:
+            - account (str): Account alias to list drafts for
+            - limit (int): Maximum drafts to return, 1-100 (default 20)
+
+    Returns:
+        str: JSON with schema:
+        {
+            "account": str,
+            "count": int,
+            "drafts": [{"draft_id": str, "message_id": str, "thread_id": str}]
+        }
+
+        Error response: "Error: <message>"
+
+    Examples:
+        - Use when: "Did you already draft that reply?"
+        - Use when: you need a draft_id before calling gmail_send_draft.
+    """
+    try:
+        config, client = await _state.get()
+        account = config.get(params.account)
+        drafts = await client.list_drafts(account.name, limit=params.limit)
+        return json.dumps(
+            {
+                "account": account.name,
+                "count": len(drafts),
+                "drafts": [
+                    {
+                        "draft_id": d.get("id", ""),
+                        "message_id": (d.get("message", {}) or {}).get("id", ""),
+                        "thread_id": (d.get("message", {}) or {}).get("threadId", ""),
+                    }
+                    for d in drafts
+                ],
+            },
+            indent=2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _handle_error(exc)
+
+
+@mcp.tool(
+    name="gmail_send_draft",
+    annotations={
+        "title": "Send an Existing Gmail Draft",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def gmail_send_draft(params: SendDraftInput) -> str:
+    """Send a draft that already exists.
+
+    This delivers mail immediately and cannot be undone. Confirm with the user
+    which draft is being sent before calling it — read it back to them first if
+    there is any doubt.
+
+    Args:
+        params (SendDraftInput): Containing:
+            - account (str): Account alias holding the draft
+            - draft_id (str): Draft ID from gmail_list_drafts
+
+    Returns:
+        str: JSON with schema:
+        {"status": "sent", "account": str, "message_id": str, "thread_id": str}
+
+        Error response: "Error: <message>"
+
+    Examples:
+        - Use when: "Send the draft you wrote earlier" — after confirming which.
+    """
+    try:
+        config, client = await _state.get()
+        account = config.get(params.account)
+        result = await client.send_draft(account.name, params.draft_id)
+        logger.info("Sent draft %s from %s", params.draft_id, account.name)
+        return json.dumps(
+            {
+                "status": "sent",
+                "account": account.name,
+                "message_id": result.get("id", ""),
+                "thread_id": result.get("threadId", ""),
             },
             indent=2,
         )

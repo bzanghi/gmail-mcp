@@ -125,6 +125,33 @@ def extract_body(payload: dict[str, Any]) -> str:
     return ""
 
 
+def extract_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """List attachment metadata: filename, MIME type, and size in bytes.
+
+    Metadata only -- content is never downloaded, since a single PDF would
+    blow the context budget. Knowing an attachment exists and what it is
+    called is what makes "did the invoice arrive?" answerable.
+    """
+    found: list[dict[str, Any]] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        filename = str(part.get("filename", "") or "")
+        body = part.get("body", {}) or {}
+        if filename and (body.get("attachmentId") or body.get("size")):
+            found.append(
+                {
+                    "filename": filename,
+                    "mime_type": str(part.get("mimeType", "")),
+                    "size_bytes": int(body.get("size", 0) or 0),
+                }
+            )
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+    return found
+
+
 def strip_quoted_reply(body: str) -> str:
     """Drop the quoted trailer from a reply.
 
@@ -230,6 +257,11 @@ def summarize_message(
     if headers.get("cc"):
         result["cc"] = headers["cc"]
 
+    attachments = extract_attachments(payload)
+    result["has_attachments"] = bool(attachments)
+    if attachments:
+        result["attachments"] = attachments
+
     if body_chars > 0:
         body = strip_quoted_reply(extract_body(payload))
         text, was_truncated = truncate(body, body_chars)
@@ -255,6 +287,12 @@ def render_messages_markdown(messages: list[dict[str, Any]], title: str) -> str:
         lines.append(f"- **Message ID**: `{msg['id']}`")
         if msg.get("snippet"):
             lines.append(f"- **Snippet**: {msg['snippet']}")
+        for attachment in msg.get("attachments", []):
+            size_kb = max(1, attachment["size_bytes"] // 1024)
+            lines.append(
+                f"- **Attachment**: {attachment['filename']} "
+                f"({attachment['mime_type']}, {size_kb} KB)"
+            )
         if msg.get("body"):
             lines.append("")
             lines.append(msg["body"])

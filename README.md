@@ -17,9 +17,11 @@ leaving your computer except to Google's own API.
 | `gmail_search_messages` | Searches one account using Gmail's own query syntax |
 | `gmail_read_message` | Reads one message, body included |
 | `gmail_read_thread` | Reads a whole conversation in order |
-| `gmail_send_message` | Sends mail, optionally as a threaded reply |
+| `gmail_send_message` | Sends mail, optionally as a threaded reply or reply-all |
 | `gmail_create_draft` | Saves a draft for you to review |
-| `gmail_modify_labels` | Marks read/unread, stars, archives, applies labels |
+| `gmail_list_drafts` | Lists drafts waiting in an account |
+| `gmail_send_draft` | Sends a draft you already reviewed |
+| `gmail_modify_labels` | Marks read/unread, stars, archives, applies labels — one message or thousands |
 | `gmail_list_labels` | Lists label IDs for an account |
 | `gmail_check_inboxes` | **Sweeps every inbox at once** and returns a short summary |
 
@@ -155,6 +157,33 @@ output — the priority comes from your own Gmail signals, not from guessing
 which words sound urgent.
 
 ---
+
+## Reliability
+
+**Transient failures are retried.** Gmail rate-limits per user, and a sweep
+across five accounts fans out enough concurrent requests to occasionally hit
+it. Any 429, 5xx, timeout, or dropped connection is retried up to four times
+with exponential backoff and full jitter, honouring Gmail's `Retry-After`
+header when it sends one. Jitter is not decoration: without it, five accounts
+failing together would retry in lockstep and re-trigger the same limit.
+
+Errors that retrying cannot fix — 401, 403, 404, 400 — fail immediately with
+an explanation, rather than making you wait through four attempts to learn
+your token was revoked.
+
+**Bulk changes cost one call.** `gmail_modify_labels` accepts `message_ids`
+and routes through Gmail's `batchModify`, so marking 200 newsletters as read
+is a single request rather than 200. Chunked automatically at the API's
+1000-ID limit.
+
+**Context stays bounded.** Listings return metadata only. Bodies have an
+explicit character budget, quoted reply trailers are stripped, and HTML is
+converted to text. Attachments are reported by name, type, and size — never
+downloaded, since one PDF would swallow the budget.
+
+**Logs go to stderr.** stdout carries the MCP protocol, so anything written
+there corrupts the stream. Set `GMAIL_MCP_LOG=DEBUG` for detail when
+diagnosing a scheduled run; the default is `WARNING`.
 
 ## Security
 

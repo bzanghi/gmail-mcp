@@ -94,4 +94,37 @@ def reply_metadata(original: dict[str, Any]) -> dict[str, str]:
         "in_reply_to": message_id,
         "references": references,
         "reply_to": headers.get("reply-to") or headers.get("from", ""),
+        # Everyone else on the original, for reply-all. The caller is
+        # responsible for removing the sending account's own address.
+        "original_to": headers.get("to", ""),
+        "original_cc": headers.get("cc", ""),
     }
+
+
+def split_addresses(raw: str) -> list[str]:
+    """Split a header value into individual addresses.
+
+    Uses email.utils.getaddresses so that display names containing commas
+    ("Doe, Jane" <jane@x.com>) do not split into fragments.
+    """
+    from email.utils import getaddresses
+
+    return [addr for _, addr in getaddresses([raw or ""]) if addr]
+
+
+def dedupe_addresses(addresses: list[str], exclude: list[str]) -> list[str]:
+    """Drop duplicates and excluded addresses, preserving order.
+
+    Matching is case-insensitive because mail addresses are compared that way
+    in practice, and this is what stops a reply-all from CC'ing the sender.
+    """
+    blocked = {a.strip().lower() for a in exclude if a and a.strip()}
+    seen: set[str] = set()
+    result: list[str] = []
+    for address in addresses:
+        key = address.strip().lower()
+        if not key or key in blocked or key in seen:
+            continue
+        seen.add(key)
+        result.append(address.strip())
+    return result

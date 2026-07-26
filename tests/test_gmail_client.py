@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from gmail_mcp.gmail_client import GmailApiError, GmailClient
@@ -168,6 +169,105 @@ class TestWrites:
     async def test_labels_listed(self, gmail_client: GmailClient) -> None:
         labels = await gmail_client.list_labels("personal")
         assert {"id": "Label_12", "name": "Receipts", "type": "user"} in labels
+
+
+class TestRetryPolicy:
+    """Transient failures must be retried; permanent ones must not be."""
+
+    def _count(self, fake: FakeGmail, suffix: str) -> int:
+        return sum(1 for r in fake.requests if r.url.path.endswith(suffix))
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    async def test_transient_statuses_are_retried(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail, status: int
+    ) -> None:
+        fake_gmail.fail_with["/profile"] = status
+        with pytest.raises(GmailApiError):
+            await gmail_client.get_profile("personal")
+        assert self._count(fake_gmail, "/profile") == gmail_client.max_attempts
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    async def test_permanent_statuses_fail_immediately(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail, status: int
+    ) -> None:
+        fake_gmail.fail_with["/profile"] = status
+        with pytest.raises(GmailApiError):
+            await gmail_client.get_profile("personal")
+        assert self._count(fake_gmail, "/profile") == 1, "must not retry"
+
+    async def test_recovers_when_a_later_attempt_succeeds(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        fake_gmail.fail_times["/profile"] = 2  # fail twice, then succeed
+        result = await gmail_client.get_profile("personal")
+        assert result["emailAddress"] == "user@example.com"
+        assert self._count(fake_gmail, "/profile") == 3
+
+    async def test_exhaustion_message_says_how_many_attempts(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        fake_gmail.fail_with["/profile"] = 503
+        with pytest.raises(GmailApiError, match="gave up after 4 attempts"):
+            await gmail_client.get_profile("personal")
+
+    async def test_retry_after_header_is_honoured(
+        self, gmail_client: GmailClient
+    ) -> None:
+        response = httpx.Response(429, headers={"Retry-After": "5"})
+        assert gmail_client._backoff_delay(1, response) == 5.0
+
+    async def test_retry_after_is_capped(self, gmail_client: GmailClient) -> None:
+        response = httpx.Response(429, headers={"Retry-After": "99999"})
+        assert gmail_client._backoff_delay(1, response) == 8.0
+
+    async def test_backoff_grows_and_is_jittered(
+        self, gmail_client: GmailClient
+    ) -> None:
+        # _random is pinned to 0.5 in the fixture, so delay == 0.5 * window.
+        delays = [gmail_client._backoff_delay(n, None) for n in (1, 2, 3, 4)]
+        assert delays == [0.25, 0.5, 1.0, 2.0]
+
+    async def test_backoff_never_exceeds_ceiling(
+        self, gmail_client: GmailClient
+    ) -> None:
+        assert gmail_client._backoff_delay(50, None) <= 8.0
+
+
+class TestBatchAndDrafts:
+    async def test_batch_modify_sends_one_request(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        count = await gmail_client.batch_modify_messages(
+            "personal", ["a", "b", "c"], remove_label_ids=["UNREAD"]
+        )
+        assert count == 3
+        batch = [r for r in fake_gmail.requests if r.url.path.endswith("batchModify")]
+        assert len(batch) == 1, "three messages must cost one API call, not three"
+
+    async def test_batch_modify_chunks_large_input(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        ids = [f"m{i}" for i in range(2500)]
+        await gmail_client.batch_modify_messages("personal", ids, add_label_ids=["X"])
+        batch = [r for r in fake_gmail.requests if r.url.path.endswith("batchModify")]
+        assert len(batch) == 3, "2500 ids should chunk into 1000/1000/500"
+
+    async def test_batch_modify_empty_is_a_no_op(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        before = len(fake_gmail.requests)
+        assert await gmail_client.batch_modify_messages("personal", []) == 0
+        assert len(fake_gmail.requests) == before
+
+    async def test_list_drafts(self, gmail_client: GmailClient) -> None:
+        drafts = await gmail_client.list_drafts("personal")
+        assert drafts[0]["id"] == "draft-1"
+
+    async def test_send_draft(
+        self, gmail_client: GmailClient, fake_gmail: FakeGmail
+    ) -> None:
+        await gmail_client.send_draft("personal", "draft-1")
+        assert fake_gmail.sent_drafts == ["draft-1"]
 
 
 class TestErrorMessages:

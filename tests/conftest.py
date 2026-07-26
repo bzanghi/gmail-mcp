@@ -139,8 +139,12 @@ class FakeGmail:
         self.drafts: list[dict[str, Any]] = []
         self.modifications: list[dict[str, Any]] = []
         self.refresh_count = 0
-        # Per-path failure injection: path suffix -> status code.
+        self.sent_drafts: list[str] = []
+        # Per-path failure injection: path suffix -> status code (always fails).
         self.fail_with: dict[str, int] = {}
+        # Per-path transient failure: path suffix -> remaining failures before
+        # the call starts succeeding. Used to test retry recovery.
+        self.fail_times: dict[str, int] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -152,6 +156,13 @@ class FakeGmail:
             if path.endswith(suffix):
                 return httpx.Response(
                     status, json={"error": {"message": "injected failure"}}
+                )
+
+        for suffix, remaining in list(self.fail_times.items()):
+            if remaining > 0 and path.endswith(suffix):
+                self.fail_times[suffix] = remaining - 1
+                return httpx.Response(
+                    503, json={"error": {"message": "transient failure"}}
                 )
 
         if path.endswith("/token"):
@@ -173,7 +184,24 @@ class FakeGmail:
             self.sent.append(body)
             return httpx.Response(200, json={"id": "sent-1", "threadId": body.get("threadId", "thread-new")})
 
+        if path.endswith("/drafts/send"):
+            self.sent_drafts.append(json.loads(request.content)["id"])
+            return httpx.Response(200, json={"id": "sent-draft-1", "threadId": "thread-9"})
+
+        if path.endswith("/messages/batchModify"):
+            self.modifications.append(json.loads(request.content))
+            return httpx.Response(204)
+
         if path.endswith("/drafts"):
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "drafts": [
+                            {"id": "draft-1", "message": {"id": "dmsg-1", "threadId": "t9"}}
+                        ]
+                    },
+                )
             body = json.loads(request.content)
             self.drafts.append(body)
             return httpx.Response(
@@ -272,7 +300,17 @@ def gmail_client(
     manager = TokenManager(
         OAuthClient("client-id", "client-secret"), token_store, http=http_client
     )
-    return GmailClient(token_manager=manager, http=http_client)
+
+    async def no_sleep(_seconds: float) -> None:
+        """Collapse retry backoff so the suite stays fast and deterministic."""
+        return None
+
+    return GmailClient(
+        token_manager=manager,
+        http=http_client,
+        _sleep=no_sleep,
+        _random=lambda: 0.5,
+    )
 
 
 @pytest.fixture
